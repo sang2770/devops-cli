@@ -1,0 +1,418 @@
+#!/usr/bin/env python3
+"""devops - setup nginx + HTTPS (certbot) nhanh cho domain, không cần tạo file tay.
+
+Ví dụ:
+  sudo devops init                                  # cài nginx + certbot
+  sudo devops site add app.example.com --proxy 3000 --ssl --email me@example.com
+  sudo devops site add blog.example.com --root /var/www/blog --ssl --email me@example.com
+  sudo devops site list
+  sudo devops site remove app.example.com
+  sudo devops ssl status
+  sudo devops ssl renew
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+AVAILABLE = "/etc/nginx/sites-available"
+ENABLED = "/etc/nginx/sites-enabled"
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+
+PROXY_TPL = """server {{
+    listen 80;
+    listen [::]:80;
+    server_name {names};
+
+    client_max_body_size {max_body};
+
+    location / {{
+        proxy_pass {upstream};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }}
+}}
+"""
+
+STATIC_TPL = """server {{
+    listen 80;
+    listen [::]:80;
+    server_name {names};
+
+    root {root};
+    index index.html index.htm;
+    client_max_body_size {max_body};
+
+    location / {{
+        try_files $uri $uri/ {fallback};
+    }}
+}}
+"""
+
+DRY = False
+
+
+def run(cmd, check=True):
+    print("$ " + " ".join(cmd))
+    if DRY:
+        return 0
+    r = subprocess.run(cmd)
+    if check and r.returncode != 0:
+        sys.exit(f"Lỗi: lệnh thất bại ({r.returncode}): {' '.join(cmd)}")
+    return r.returncode
+
+
+def need_root():
+    if not DRY and os.geteuid() != 0:
+        sys.exit("Cần quyền root. Chạy lại với sudo.")
+
+
+def conf_path(domain):
+    return os.path.join(AVAILABLE, domain)
+
+
+def check_domain(d):
+    d = d.lower().strip()
+    if not DOMAIN_RE.match(d):
+        sys.exit(f"Domain không hợp lệ: {d}")
+    return d
+
+
+def nginx_test_reload():
+    run(["nginx", "-t"])
+    run(["systemctl", "reload", "nginx"])
+
+
+def cmd_init(a):
+    need_root()
+    run(["apt-get", "update"])
+    run(["apt-get", "install", "-y", "nginx", "certbot", "python3-certbot-nginx"])
+    run(["systemctl", "enable", "--now", "nginx"])
+    if shutil.which("ufw"):
+        run(["ufw", "allow", "Nginx Full"], check=False)
+    # certbot tự cài timer gia hạn; đảm bảo bật
+    run(["systemctl", "enable", "--now", "certbot.timer"], check=False)
+    print("Xong. Thêm site: sudo devops site add <domain> --proxy 3000 --ssl --email <email>")
+
+
+def cmd_site_add(a):
+    need_root()
+    domain = check_domain(a.domain)
+    names = [domain]
+    if a.www:
+        names.append("www." + domain)
+    path = conf_path(domain)
+    if os.path.exists(path) and not a.force:
+        sys.exit(f"{path} đã tồn tại. Dùng --force để ghi đè.")
+    if bool(a.proxy) == bool(a.root):
+        sys.exit("Chọn đúng một: --proxy <port|url> hoặc --root <thư mục>.")
+
+    if a.proxy:
+        upstream = a.proxy if "://" in a.proxy else f"http://127.0.0.1:{a.proxy}"
+        content = PROXY_TPL.format(names=" ".join(names), upstream=upstream, max_body=a.max_body)
+    else:
+        root = os.path.abspath(a.root)
+        if not DRY:
+            os.makedirs(root, exist_ok=True)
+        fallback = "/index.html" if a.spa else "=404"
+        content = STATIC_TPL.format(names=" ".join(names), root=root, fallback=fallback, max_body=a.max_body)
+
+    backup = None
+    if os.path.exists(path):
+        backup = path + ".bak"
+        if not DRY:
+            shutil.copy2(path, backup)
+    print(f"--- {path}\n{content}")
+    if not DRY:
+        with open(path, "w") as f:
+            f.write(content)
+        link = os.path.join(ENABLED, domain)
+        if not os.path.lexists(link):
+            os.symlink(path, link)
+
+    try:
+        nginx_test_reload()
+    except SystemExit:
+        # rollback nếu cấu hình lỗi
+        if not DRY:
+            if backup:
+                shutil.move(backup, path)
+            else:
+                os.remove(path)
+                os.remove(os.path.join(ENABLED, domain))
+        sys.exit("nginx -t lỗi, đã rollback cấu hình.")
+
+    if a.ssl:
+        if not a.email:
+            sys.exit("--ssl cần --email.")
+        issue_cert(names, a.email, a.staging)
+    print(f"OK: {'https' if a.ssl else 'http'}://{domain}")
+
+
+def issue_cert(names, email, staging=False):
+    cmd = ["certbot", "--nginx", "--non-interactive", "--agree-tos", "-m", email, "--redirect"]
+    for n in names:
+        cmd += ["-d", n]
+    if staging:
+        cmd.append("--staging")
+    run(cmd)
+
+
+def cmd_site_list(a):
+    if not os.path.isdir(AVAILABLE):
+        sys.exit("Chưa cài nginx. Chạy: sudo devops init")
+    for name in sorted(os.listdir(AVAILABLE)):
+        if name == "default" or name.endswith(".bak"):
+            continue
+        on = os.path.lexists(os.path.join(ENABLED, name))
+        print(f"{'[on ]' if on else '[off]'} {name}")
+
+
+def cmd_site_remove(a):
+    need_root()
+    domain = check_domain(a.domain)
+    for p in (os.path.join(ENABLED, domain), conf_path(domain)):
+        if os.path.lexists(p):
+            print(f"xoá {p}")
+            if not DRY:
+                os.remove(p)
+    if a.cert:
+        run(["certbot", "delete", "--non-interactive", "--cert-name", domain], check=False)
+    nginx_test_reload()
+
+
+def cmd_site_toggle(a):
+    need_root()
+    domain = check_domain(a.domain)
+    link = os.path.join(ENABLED, domain)
+    if a.enable:
+        if not os.path.exists(conf_path(domain)):
+            sys.exit("Site không tồn tại.")
+        if not os.path.lexists(link) and not DRY:
+            os.symlink(conf_path(domain), link)
+    elif os.path.lexists(link) and not DRY:
+        os.remove(link)
+    nginx_test_reload()
+
+
+def cmd_ssl_issue(a):
+    need_root()
+    domain = check_domain(a.domain)
+    names = [domain] + (["www." + domain] if a.www else [])
+    issue_cert(names, a.email, a.staging)
+
+
+def cmd_ssl_status(a):
+    run(["certbot", "certificates"])
+
+
+def cmd_ssl_renew(a):
+    need_root()
+    run(["certbot", "renew", "--dry-run" if a.test else "--quiet"])
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="devops", description="nginx + certbot helper")
+    p.add_argument("--dry-run", action="store_true", help="chỉ in lệnh, không thực thi/ghi file")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("init", help="cài nginx + certbot").set_defaults(fn=cmd_init)
+
+    site = sub.add_parser("site", help="quản lý site").add_subparsers(dest="sub", required=True)
+
+    add = site.add_parser("add", help="tạo site nginx (+ HTTPS)")
+    add.add_argument("domain")
+    add.add_argument("--proxy", help="reverse proxy tới port (3000) hoặc URL (http://10.0.0.5:8080)")
+    add.add_argument("--root", help="thư mục static site")
+    add.add_argument("--spa", action="store_true", help="static: fallback về /index.html")
+    add.add_argument("--www", action="store_true", help="thêm www.<domain>")
+    add.add_argument("--ssl", action="store_true", help="cấp HTTPS bằng certbot")
+    add.add_argument("--email", help="email cho Let's Encrypt")
+    add.add_argument("--staging", action="store_true", help="dùng Let's Encrypt staging để test")
+    add.add_argument("--max-body", default="20m", help="client_max_body_size (mặc định 20m)")
+    add.add_argument("--force", action="store_true", help="ghi đè site đã có")
+    add.set_defaults(fn=cmd_site_add)
+
+    site.add_parser("list", help="liệt kê site").set_defaults(fn=cmd_site_list)
+
+    rm = site.add_parser("remove", help="xoá site")
+    rm.add_argument("domain")
+    rm.add_argument("--cert", action="store_true", help="xoá luôn chứng chỉ")
+    rm.set_defaults(fn=cmd_site_remove)
+
+    for name, en in (("enable", True), ("disable", False)):
+        t = site.add_parser(name, help=f"{name} site")
+        t.add_argument("domain")
+        t.set_defaults(fn=cmd_site_toggle, enable=en)
+
+    ssl = sub.add_parser("ssl", help="quản lý chứng chỉ").add_subparsers(dest="sub", required=True)
+    iss = ssl.add_parser("issue", help="cấp cert cho site đã có")
+    iss.add_argument("domain")
+    iss.add_argument("--email", required=True)
+    iss.add_argument("--www", action="store_true")
+    iss.add_argument("--staging", action="store_true")
+    iss.set_defaults(fn=cmd_ssl_issue)
+    ssl.add_parser("status", help="xem cert & hạn").set_defaults(fn=cmd_ssl_status)
+    rn = ssl.add_parser("renew", help="gia hạn")
+    rn.add_argument("--test", action="store_true", help="dry-run gia hạn")
+    rn.set_defaults(fn=cmd_ssl_renew)
+    return p
+
+
+def ask(label, default=None, required=True, validate=None):
+    """Hỏi 1 câu, lặp lại tới khi hợp lệ."""
+    while True:
+        hint = f" [{default}]" if default else ""
+        v = input(f"{label}{hint}: ").strip() or (default or "")
+        if not v and required:
+            print("  ! Không được để trống.")
+            continue
+        if v and validate:
+            err = validate(v)
+            if err:
+                print(f"  ! {err}")
+                continue
+        return v
+
+
+def yesno(label, default=True):
+    d = "Y/n" if default else "y/N"
+    v = input(f"{label} [{d}]: ").strip().lower()
+    return default if not v else v in ("y", "yes", "c", "co", "có")
+
+
+def choose(label, options):
+    for i, o in enumerate(options, 1):
+        print(f"  {i}) {o}")
+    return int(ask(label, validate=lambda v: None if v.isdigit() and 1 <= int(v) <= len(options) else "Chọn số trong danh sách")) - 1
+
+
+def v_domain(v):
+    return None if DOMAIN_RE.match(v.lower()) else "Domain không hợp lệ (vd: app.example.com)"
+
+
+def v_port(v):
+    return None if (v.isdigit() and 1 <= int(v) <= 65535) or "://" in v else "Port 1-65535 hoặc URL http://..."
+
+
+def v_email(v):
+    return None if re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v) else "Email không hợp lệ"
+
+
+def wizard_add_site():
+    print("\n== Thêm site mới ==")
+    domain = ask("1. Domain", validate=v_domain).lower()
+    kind = choose("2. Loại site", ["Reverse proxy (Node/Python/Docker... chạy ở 1 port)", "Static site (thư mục HTML)", "SPA (React/Vue build, fallback index.html)"])
+    ns = argparse.Namespace(domain=domain, proxy=None, root=None, spa=kind == 2, www=False,
+                            ssl=False, email=None, staging=False, max_body="20m", force=False)
+    if kind == 0:
+        ns.proxy = ask("3. Port của app (hoặc URL upstream)", "3000", validate=v_port)
+    else:
+        ns.root = ask("3. Thư mục chứa file build", f"/var/www/{domain}")
+    ns.www = yesno(f"4. Thêm www.{domain}?", False)
+    ns.max_body = ask("5. Giới hạn upload (client_max_body_size)", "20m")
+    ns.ssl = yesno("6. Cấp HTTPS bằng certbot?", True)
+    if ns.ssl:
+        ns.email = ask("   Email Let's Encrypt", validate=v_email)
+        ns.staging = yesno("   Dùng staging để test (cert không hợp lệ)?", False)
+    if os.path.exists(conf_path(domain)):
+        ns.force = yesno(f"! {domain} đã tồn tại, ghi đè?", False)
+        if not ns.force:
+            return
+    print("\n--- Tóm tắt ---")
+    for k, v in vars(ns).items():
+        if v not in (None, False):
+            print(f"  {k}: {v}")
+    if yesno("Tiến hành?", True):
+        cmd_site_add(ns)
+
+
+def wizard_pick_site(label):
+    if not os.path.isdir(AVAILABLE):
+        print("Chưa cài nginx. Chọn 'Cài đặt' trước.")
+        return None
+    sites = [s for s in sorted(os.listdir(AVAILABLE)) if s != "default" and not s.endswith(".bak")]
+    if not sites:
+        print("Chưa có site nào.")
+        return None
+    return sites[choose(label, sites)]
+
+
+def wizard_remove():
+    d = wizard_pick_site("Chọn site cần xoá")
+    if d and yesno(f"Xoá {d}?", False):
+        cmd_site_remove(argparse.Namespace(domain=d, cert=yesno("Xoá luôn chứng chỉ SSL?", False)))
+
+
+def wizard_toggle():
+    d = wizard_pick_site("Chọn site")
+    if d:
+        on = choose("Hành động", ["Enable", "Disable"]) == 0
+        cmd_site_toggle(argparse.Namespace(domain=d, enable=on))
+
+
+def wizard_ssl():
+    d = wizard_pick_site("Chọn site cần cấp HTTPS")
+    if d:
+        email = ask("Email Let's Encrypt", validate=v_email)
+        cmd_ssl_issue(argparse.Namespace(domain=d, email=email, www=yesno(f"Gồm www.{d}?", False),
+                                         staging=yesno("Dùng staging?", False)))
+
+
+MENU = [
+    ("Cài đặt nginx + certbot", lambda: cmd_init(None)),
+    ("Thêm site (domain → port/thư mục, + HTTPS)", wizard_add_site),
+    ("Danh sách site", lambda: cmd_site_list(None)),
+    ("Cấp HTTPS cho site đã có", wizard_ssl),
+    ("Bật / tắt site", wizard_toggle),
+    ("Xoá site", wizard_remove),
+    ("Xem chứng chỉ SSL & hạn", lambda: cmd_ssl_status(None)),
+    ("Test gia hạn SSL", lambda: cmd_ssl_renew(argparse.Namespace(test=True))),
+]
+
+
+def interactive():
+    need_root()
+    while True:
+        print("\n===== DEVOPS: nginx + HTTPS =====")
+        for i, (name, _) in enumerate(MENU, 1):
+            print(f"  {i}) {name}")
+        print("  0) Thoát")
+        c = input("Chọn: ").strip()
+        if c == "0":
+            return
+        if c.isdigit() and 1 <= int(c) <= len(MENU):
+            try:
+                MENU[int(c) - 1][1]()
+            except SystemExit as e:  # lỗi từ run()/validate: báo rồi quay lại menu
+                if e.code not in (None, 0):
+                    print(f"\n✗ {e.code}")
+            except (KeyboardInterrupt, EOFError):
+                print("\nĐã huỷ.")
+        else:
+            print("Lựa chọn không hợp lệ.")
+
+
+def main():
+    global DRY
+    if len(sys.argv) == 1 or sys.argv[1:] == ["--dry-run"]:
+        DRY = "--dry-run" in sys.argv
+        try:
+            interactive()
+        except (KeyboardInterrupt, EOFError):
+            print()
+        return
+    a = build_parser().parse_args()
+    DRY = a.dry_run
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()
